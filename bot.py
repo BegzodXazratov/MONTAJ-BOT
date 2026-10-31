@@ -60,6 +60,7 @@ class Session:
     opt: Options = field(default_factory=Options)
     stt_done: bool = False
     stt_error: str = ""
+    ready: asyncio.Event = field(default_factory=asyncio.Event)  # video yuklab olindi
 
 
 sessions: dict[int, Session] = {}
@@ -129,16 +130,7 @@ async def on_video(m: Message):
     s = Session(uid=uid, work=tempfile.mkdtemp(prefix="mb_"))
     s.src = os.path.join(s.work, "in.mp4")
     sessions[uid] = s
-    note = await m.answer("✅ Video qabul qilindi. Montaj sozlamalarini tanlaymiz — shu orada matn tayyorlanadi.")
-    try:
-        f = await bot.get_file(media.file_id)
-        if LOCAL_API and f.file_path and os.path.isabs(f.file_path):
-            shutil.copy(f.file_path, s.src)
-        else:
-            await bot.download_file(f.file_path, s.src)
-    except Exception as e:
-        drop(uid)
-        return await note.edit_text(f"❌ Videoni yuklab bo'lmadi: {str(e)[:200]}")
+    await m.answer("✅ Video qabul qilindi. Montaj sozlamalarini tanlaymiz — shu orada matn tayyorlanadi.")
 
     async def job():  # fonda: nutq → matn
         try:
@@ -155,7 +147,23 @@ async def on_video(m: Message):
         if sessions.get(uid) is s and s.stage == "wait_text":
             await show_text(m, s)
 
-    await queue.put(job)
+    async def download():  # fonda: videoni yuklab olish, keyin matn navbatga
+        try:
+            f = await bot.get_file(media.file_id)
+            if LOCAL_API and f.file_path and os.path.isabs(f.file_path):
+                shutil.copy(f.file_path, s.src)
+            else:
+                await bot.download_file(f.file_path, s.src, timeout=300)
+            log.info("downloaded user=%s %.1f MB", uid, os.path.getsize(s.src) / 1048576)
+        except Exception as e:
+            log.exception("download failed")
+            s.stt_error, s.stt_done = f"Videoni yuklab bo'lmadi: {str(e)[:200]}", True
+            s.ready.set()
+            return
+        s.ready.set()
+        await queue.put(job)
+
+    asyncio.create_task(download())
     await ask_cut(m)
 
 
@@ -197,6 +205,7 @@ async def ask_cut(m: Message):
 
 async def ask_style(m: Message, s: Session):
     wait = await m.answer("🎨 Subtitr uslublari tayyorlanmoqda…")
+    await s.ready.wait()
     try:
         media = []
         mid = pipeline.probe(s.src)["duration"] / 2
