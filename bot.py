@@ -1,7 +1,7 @@
-"""Montaj bot — eng oddiy versiya.
+"""Montaj bot.
 
-Foydalanuvchi talking head video tashlaydi → bot jimliklarni kesadi, 9:16 qiladi,
-ovozni tekislaydi, o'zbekcha karaoke subtitr qo'yadi va tayyor Reels'ni qaytaradi.
+Jarayon: video → matn (tasdiqlash yoki tuzatish) → pauzalar kesilsinmi → subtitr uslubi (ko'rinishi bilan)
+→ zoom → rasmlar va joylashuvi → yakuniy tasdiq → montaj → tayyor Reels.
 """
 from __future__ import annotations
 
@@ -11,16 +11,20 @@ import os
 import shutil
 import tempfile
 import time
+from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, Message
+from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
+                           InputMediaPhoto, Message)
 from dotenv import load_dotenv
 
 import pipeline
 import stt
+from pipeline import STYLES, Options
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -29,28 +33,59 @@ log = logging.getLogger("montaj")
 TOKEN = os.environ["BOT_TOKEN"]
 DEFAULT_STT = os.getenv("STT", "eleven")
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_IDS", "").replace(" ", "").split(",") if x}
-LOCAL_API = os.getenv("TELEGRAM_API_URL")  # o'z Bot API serverimiz bo'lsa (20MB cheklovisiz)
+LOCAL_API = os.getenv("TELEGRAM_API_URL")
 MAX_MB = 2000 if LOCAL_API else 20
+MAX_IMAGES = 10
 
 session = AiohttpSession(api=TelegramAPIServer.from_base(LOCAL_API, is_local=True)) if LOCAL_API else None
 bot = Bot(TOKEN, session=session) if session else Bot(TOKEN)
 dp = Dispatcher()
-queue: asyncio.Queue = asyncio.Queue()
+queue: asyncio.Queue[Callable[[], Awaitable[None]]] = asyncio.Queue()
 user_stt: dict[int, str] = {}
+
+MOTIONS = {"none": "Oddiy (zoomsiz)", "soft": "Yumshoq zoom", "jump": "Jump-cut zoom"}
+LAYOUTS = {"under": "Subtitr ostida", "split": "Ekran 50/50"}
+STYLE_KEYS = list(STYLES)
+
+
+@dataclass
+class Session:
+    uid: int
+    work: str
+    src: str = ""
+    words: list = field(default_factory=list)
+    provider: str = ""
+    stage: str = "stt"  # stt → text → cut → style → motion → images → layout → confirm → render
+    opt: Options = field(default_factory=Options)
+
+
+sessions: dict[int, Session] = {}
+
+
+def kb(*rows: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t, d in r] for r in rows])
+
+
+def allowed(uid: int | None) -> bool:
+    return not ALLOWED or (uid in ALLOWED)
+
+
+def drop(uid: int):
+    s = sessions.pop(uid, None)
+    if s:
+        shutil.rmtree(s.work, ignore_errors=True)
+
 
 HELLO = (
     "Salom! Men montaj botman 🎬\n\n"
-    "Talking head video tashlang (vertikal yoki gorizontal), men:\n"
-    "• jimlik va pauzalarni kesaman\n"
-    "• 9:16 Reels formatiga keltiraman\n"
-    "• ovozni tekislayman\n"
-    "• o'zbekcha karaoke subtitr qo'yaman\n\n"
-    f"Video {MAX_MB} MB gacha bo'lsin. 1 daqiqalik video ~1–3 daqiqada tayyor bo'ladi."
+    "Talking head video tashlang — men:\n"
+    "1. nutqni matnga o'giraman va sizga tasdiqlatib olaman\n"
+    "2. pauzalarni kesish-kesmaslikni so'rayman\n"
+    "3. 4 xil subtitr uslubini ko'rsataman — tanlaysiz\n"
+    "4. zoom (yumshoq yoki jump-cut) qo'shaman\n"
+    "5. rasm yuborsangiz — subtitr ostida yoki ekranni 50/50 bo'lib chiqaraman\n\n"
+    f"Video {MAX_MB} MB gacha. Bekor qilish: /bekor"
 )
-
-
-def allowed(m: Message) -> bool:
-    return not ALLOWED or (m.from_user and m.from_user.id in ALLOWED)
 
 
 @dp.message(Command("start", "help"))
@@ -58,77 +93,238 @@ async def start(m: Message):
     await m.answer(HELLO)
 
 
+@dp.message(Command("bekor"))
+async def cancel(m: Message):
+    drop(m.from_user.id)
+    await m.answer("Bekor qilindi. Yangi video tashlashingiz mumkin.")
+
+
 @dp.message(Command("stt"))
 async def set_stt(m: Message):
-    """Sinov uchun: /stt whisper yoki /stt eleven"""
-    if not allowed(m):
+    if not allowed(m.from_user.id):
         return
     arg = (m.text or "").split(maxsplit=1)[1:] or [""]
     if arg[0] in stt.PROVIDERS:
         user_stt[m.from_user.id] = arg[0]
         await m.answer(f"Endi nutq {arg[0]} orqali o'giriladi.")
     else:
-        cur = user_stt.get(m.from_user.id, DEFAULT_STT)
-        await m.answer(f"Hozir: {cur}. O'zgartirish: /stt whisper yoki /stt eleven")
+        await m.answer(f"Hozir: {user_stt.get(m.from_user.id, DEFAULT_STT)}. O'zgartirish: /stt whisper yoki /stt eleven")
 
 
+# ---------------- 1. video qabul qilish va matn ----------------
 @dp.message(F.video | F.video_note | (F.document & F.document.mime_type.startswith("video/")))
 async def on_video(m: Message):
-    if not allowed(m):
+    if not allowed(m.from_user.id):
         return await m.answer("Bot hozircha yopiq sinovda. Tez orada ochiladi!")
     media = m.video or m.video_note or m.document
     size_mb = (media.file_size or 0) / 1024 / 1024
     if size_mb > MAX_MB:
-        return await m.answer(
-            f"Video {size_mb:.0f} MB — men hozircha {MAX_MB} MB gacha qabul qilaman.\n"
-            "Videoni fayl emas, oddiy video qilib yuboring — Telegram o'zi siqadi."
-        )
+        return await m.answer(f"Video {size_mb:.0f} MB — hozircha {MAX_MB} MB gacha qabul qilaman.\n"
+                              "Videoni fayl emas, oddiy video qilib yuboring — Telegram o'zi siqadi.")
+    uid = m.from_user.id
+    drop(uid)
+    s = Session(uid=uid, work=tempfile.mkdtemp(prefix="mb_"))
+    s.src = os.path.join(s.work, "in.mp4")
+    sessions[uid] = s
     pos = queue.qsize() + 1
-    note = await m.answer("✅ Qabul qilindi. Montaj boshlandi…" if pos == 1 else f"✅ Qabul qilindi. Navbatda: {pos}-o'rin")
-    await queue.put((m, media.file_id, note))
+    note = await m.answer("✅ Qabul qilindi. Nutq matnga o'girilmoqda…" if pos == 1 else f"✅ Qabul qilindi. Navbatda: {pos}-o'rin")
+
+    async def job():
+        try:
+            f = await bot.get_file(media.file_id)
+            if LOCAL_API and f.file_path and os.path.isabs(f.file_path):
+                shutil.copy(f.file_path, s.src)
+            else:
+                await bot.download_file(f.file_path, s.src)
+            await note.edit_text("🎧 Nutq matnga o'girilmoqda…")
+            wav = os.path.join(s.work, "a.wav")
+            await asyncio.to_thread(pipeline.extract_audio, s.src, wav)
+            tr = await asyncio.to_thread(stt.transcribe, wav, user_stt.get(uid, DEFAULT_STT))
+            if not tr.words:
+                raise RuntimeError("Videoda nutq topilmadi")
+            s.words, s.provider, s.stage = tr.words, tr.provider, "text"
+            await note.delete()
+            await send_text(m, s)
+        except Exception as e:
+            log.exception("stt failed")
+            drop(uid)
+            await note.edit_text(f"❌ Xatolik: {str(e)[:300]}")
+
+    await queue.put(job)
 
 
-async def process(m: Message, file_id: str, note: Message):
-    work = tempfile.mkdtemp(prefix="mb_")
-    t0 = time.time()
-    provider = user_stt.get(m.from_user.id, DEFAULT_STT)
+async def send_text(m: Message, s: Session):
+    text = " ".join(w.text for w in s.words)
+    await m.answer(
+        f"📝 Matn ({s.provider}):\n\n{text[:3500]}\n\n"
+        "To'g'rimi? Xato bo'lsa — matnni nusxalab, tuzatib, shu yerga yozib yuboring.",
+        reply_markup=kb([("✅ Matn to'g'ri", "ok_text")]),
+    )
+
+
+@dp.message(F.text & ~F.text.startswith("/"))
+async def on_text(m: Message):
+    s = sessions.get(m.from_user.id)
+    if not s or s.stage != "text":
+        return await m.answer("Video tashlang — montajni boshlaymiz 🎬")
+    s.words = pipeline.align_text(s.words, m.text)
+    s.provider = "tuzatilgan"
+    await send_text(m, s)
+
+
+# ---------------- 2–6. tanlovlar ----------------
+async def ask_cut(m: Message):
+    await m.answer("✂️ Pauzalarni kesaymi?\n(Ataylab qilingan pauzalar bo'lsa — kesmang)",
+                   reply_markup=kb([("✂️ Ha, kesilsin", "cut:1"), ("⏸ Yo'q, qoldirilsin", "cut:0")]))
+
+
+async def ask_style(m: Message, s: Session):
+    wait = await m.answer("🎨 Subtitr uslublari tayyorlanmoqda…")
     try:
-        src, wav, out = (os.path.join(work, n) for n in ("in.mp4", "a.wav", "reel.mp4"))
-        f = await bot.get_file(file_id)
-        if LOCAL_API and f.file_path and os.path.isabs(f.file_path):
-            shutil.copy(f.file_path, src)
+        media = []
+        for i, k in enumerate(STYLE_KEYS, 1):
+            jpg = os.path.join(s.work, f"pv_{k}.jpg")
+            await asyncio.to_thread(pipeline.preview, s.src, s.words, k, jpg, s.work)
+            media.append(InputMediaPhoto(media=FSInputFile(jpg), caption=f"{i}. {STYLES[k].name}"))
+        await m.answer_media_group(media)
+    except Exception:
+        log.exception("preview failed")
+    await wait.delete()
+    rows = [[(f"{i}. {STYLES[k].name.split(' —')[0]}", f"style:{k}") for i, k in enumerate(STYLE_KEYS[j:j + 2], j + 1)]
+            for j in range(0, len(STYLE_KEYS), 2)]
+    await m.answer("🎨 Qaysi subtitr uslubi?", reply_markup=kb(*rows, [("🚫 Subtitrsiz", "style:-")]))
+
+
+async def ask_motion(m: Message):
+    await m.answer("🎥 Kamera harakati:\n• Yumshoq zoom — butun video davomida sekin yaqinlashadi\n"
+                   "• Jump-cut zoom — har kesimda kadr navbat bilan yaqinlashib-uzoqlashadi",
+                   reply_markup=kb([("Oddiy", "motion:none")], [("🔍 Yumshoq zoom", "motion:soft"), ("⚡ Jump-cut", "motion:jump")]))
+
+
+async def ask_images(m: Message, s: Session):
+    n = len(s.opt.images)
+    txt = ("🖼 Videoga rasm qo'shasizmi? Rasmlarni shu yerga yuboring (10 tagacha), keyin «Tayyor» ni bosing.\n"
+           "Rasmlar video bo'ylab teng taqsimlanib chiqadi." if not n else f"🖼 {n} ta rasm qabul qilindi. Yana yuboring yoki «Tayyor».")
+    await m.answer(txt, reply_markup=kb([("⏭ Rasmsiz", "img:skip"), (f"✅ Tayyor ({n})", "img:done")]))
+
+
+async def ask_layout(m: Message):
+    await m.answer("📐 Rasm qayerda chiqsin?\n• Subtitr ostida — rasm pastda kartochka bo'lib, subtitr uning ustida\n"
+                   "• Ekran 50/50 — tepada rasm, pastda siz",
+                   reply_markup=kb([("⬇️ Subtitr ostida", "layout:under"), ("🌓 Ekran 50/50", "layout:split")]))
+
+
+async def ask_confirm(m: Message, s: Session):
+    o = s.opt
+    lines = [
+        "📋 Montaj sozlamalari:",
+        f"• Pauzalar: {'kesiladi' if o.cut else 'qoldiriladi'}",
+        "• Subtitr: " + (STYLES[o.style].name.split(" —")[0] if o.style else "yo'q"),
+        f"• Kamera: {MOTIONS[o.motion]}",
+        f"• Rasmlar: {len(o.images)} ta" + (f", {LAYOUTS[o.layout]}" if o.images else ""),
+    ]
+    await m.answer("\n".join(lines), reply_markup=kb([("🎬 Montajni boshlash", "go")], [("🔄 Qaytadan tanlash", "redo")]))
+
+
+@dp.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
+async def on_photo(m: Message):
+    s = sessions.get(m.from_user.id)
+    if not s or s.stage != "images":
+        return await m.answer("Rasmni videoni sozlash paytida, «rasm qo'shasizmi?» bosqichida yuboring.")
+    if len(s.opt.images) >= MAX_IMAGES:
+        return await m.answer(f"Ko'pi bilan {MAX_IMAGES} ta rasm.")
+    fid = m.photo[-1].file_id if m.photo else m.document.file_id
+    path = os.path.join(s.work, f"img_{len(s.opt.images)}.jpg")
+    f = await bot.get_file(fid)
+    await bot.download_file(f.file_path, path)
+    s.opt.images.append(path)
+    await ask_images(m, s)
+
+
+@dp.callback_query()
+async def on_cb(c: CallbackQuery):
+    s = sessions.get(c.from_user.id)
+    await c.answer()
+    if not s:
+        return await c.message.answer("Sessiya tugagan. Videoni qayta tashlang.")
+    data = c.data or ""
+    key, _, val = data.partition(":")
+    m = c.message
+    try:
+        await m.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if key == "ok_text" and s.stage == "text":
+        s.stage = "cut"
+        await ask_cut(m)
+    elif key == "cut" and s.stage == "cut":
+        s.opt.cut = val == "1"
+        s.stage = "style"
+        await ask_style(m, s)
+    elif key == "style" and s.stage == "style":
+        s.opt.style = None if val == "-" else val
+        s.stage = "motion"
+        await ask_motion(m)
+    elif key == "motion" and s.stage == "motion":
+        s.opt.motion = val
+        s.stage = "images"
+        await ask_images(m, s)
+    elif key == "img" and s.stage == "images":
+        if val == "skip":
+            s.opt.images = []
+        if s.opt.images:
+            s.stage = "layout"
+            await ask_layout(m)
         else:
-            await bot.download_file(f.file_path, src)
+            s.stage = "confirm"
+            await ask_confirm(m, s)
+    elif key == "layout" and s.stage == "layout":
+        s.opt.layout = val
+        s.stage = "confirm"
+        await ask_confirm(m, s)
+    elif key == "redo" and s.stage == "confirm":
+        s.opt = Options()
+        s.stage = "cut"
+        await ask_cut(m)
+    elif key == "go" and s.stage == "confirm":
+        s.stage = "render"
+        await start_render(m, s)
 
-        await note.edit_text("🎧 Nutq matnga o'girilmoqda…")
-        await asyncio.to_thread(pipeline.extract_audio, src, wav)
-        tr = await asyncio.to_thread(stt.transcribe, wav, provider)
 
-        await note.edit_text("✂️ Kesilmoqda va subtitr qo'yilmoqda…")
-        res = await asyncio.to_thread(pipeline.make_reel, src, tr.words, out, work)
+# ---------------- 7. montaj ----------------
+async def start_render(m: Message, s: Session):
+    pos = queue.qsize() + 1
+    note = await m.answer("🎬 Montaj boshlandi…" if pos == 1 else f"🎬 Navbatda: {pos}-o'rin")
 
-        took = time.time() - t0
-        cap = (
-            f"Tayyor ✅  {res['before']:.0f} s → {res['after']:.0f} s, {res['cuts']} ta pauza kesildi.\n"
-            f"Nutq: {tr.provider} ({tr.seconds:.0f} s), jami {took:.0f} s."
-        )
-        await m.answer_video(FSInputFile(out, filename="reel.mp4"), caption=cap, width=1080, height=1920,
-                             supports_streaming=True)
-        await m.answer(f"📝 Matn ({tr.provider}):\n\n{tr.text[:3500]}")
-        await note.delete()
-        log.info("done user=%s stt=%s %.1fs words=%d", m.from_user.id, provider, took, len(tr.words))
-    except Exception as e:  # foydalanuvchiga tushunarli xabar, logga to'liq xato
-        log.exception("failed user=%s", m.from_user.id)
-        await note.edit_text(f"❌ Xatolik: {str(e)[:300]}\nBoshqa video bilan urinib ko'ring.")
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    async def job():
+        t0 = time.time()
+        try:
+            await note.edit_text("🎬 Montaj qilinmoqda… (1 daqiqalik videoga ~1–3 daqiqa)")
+            out = os.path.join(s.work, "reel.mp4")
+            res = await asyncio.to_thread(pipeline.make_reel, s.src, s.words, out, s.work, s.opt)
+            cap = (f"Tayyor ✅  {res['before']:.0f} s → {res['after']:.0f} s"
+                   + (f", {res['cuts']} ta pauza kesildi" if s.opt.cut else "") + f". ({time.time() - t0:.0f} s)")
+            await m.answer_video(FSInputFile(out, filename="reel.mp4"), caption=cap, width=1080, height=1920,
+                                 supports_streaming=True)
+            await note.delete()
+            log.info("done user=%s opt=%s %.1fs", s.uid, s.opt, time.time() - t0)
+        except Exception as e:
+            log.exception("render failed")
+            await note.edit_text(f"❌ Xatolik: {str(e)[:300]}")
+        finally:
+            drop(s.uid)
+
+    await queue.put(job)
 
 
 async def worker():
     while True:
-        m, file_id, note = await queue.get()
+        job = await queue.get()
         try:
-            await process(m, file_id, note)
+            await job()
+        except Exception:
+            log.exception("job failed")
         finally:
             queue.task_done()
 
