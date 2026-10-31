@@ -60,6 +60,12 @@ def whisper_transcribe(wav: str, language: str = "uz") -> Transcript:
         vad_filter=True,
         beam_size=5,
         condition_on_previous_text=False,
+        # o'zbek lotin imlosiga yo'naltiruvchi namuna matn (Whisper ko'pincha turkchaga og'ib ketadi)
+        initial_prompt=os.getenv(
+            "WHISPER_PROMPT",
+            "Assalomu alaykum, do'stlar. Bugun sizga o'zbek tilida gapiraman. "
+            "Reklama, mijoz, lid, qo'ng'iroq, sotuv, ko'rsatish, g'oya, yo'q, bo'ladi, qilamiz.",
+        ),
     )
     words: list[Word] = []
     for seg in segments:
