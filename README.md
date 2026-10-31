@@ -19,8 +19,8 @@ Nutqni matnga o'girish ikki xil: **ElevenLabs Scribe** (pullik, aniqroq) yoki **
 
 ```bash
 curl -fsSL https://get.docker.com | sh
-git clone https://github.com/BegzodXazratov/montaj-bot.git
-cd montaj-bot
+git clone https://github.com/BegzodXazratov/MONTAJ-BOT.git
+cd MONTAJ-BOT
 cp .env.example .env
 nano .env          # BOT_TOKEN, ELEVENLABS_API_KEY, ALLOWED_IDS ni yozing → Ctrl+O, Enter, Ctrl+X
 docker compose up -d --build
