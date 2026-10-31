@@ -15,19 +15,21 @@ Nutqni matnga o'girish ikki xil: **ElevenLabs Scribe** (pullik, aniqroq) yoki **
 1. **Bot yarating:** Telegram'da @BotFather → `/newbot` → token oling.
 2. **ElevenLabs kaliti:** elevenlabs.io → Profile → API Keys → yangi kalit (Speech to Text ruxsati bilan).
 3. **O'z Telegram ID'ingiz:** @userinfobot ga yozing — raqamni oling.
-4. **Serverga ulaning va o'rnating:**
+4. **2 GB gacha video uchun:** my.telegram.org → telefon raqam bilan kiring → **API development tools** → istalgan nom bilan ilova yarating → `api_id` va `api_hash` ni oling.
+   Bir martalik: botni oddiy Telegram serveridan chiqaring — brauzerda oching: `https://api.telegram.org/bot<TOKEN>/logOut`
+5. **Serverga ulaning va o'rnating:**
 
 ```bash
 curl -fsSL https://get.docker.com | sh
 git clone https://github.com/BegzodXazratov/MONTAJ-BOT.git
 cd MONTAJ-BOT
 cp .env.example .env
-nano .env          # BOT_TOKEN, ELEVENLABS_API_KEY, ALLOWED_IDS ni yozing → Ctrl+O, Enter, Ctrl+X
+nano .env          # BOT_TOKEN, TELEGRAM_API_ID/HASH, ELEVENLABS_API_KEY, ALLOWED_IDS ni yozing → Ctrl+O, Enter, Ctrl+X
 docker compose up -d --build
 docker compose logs -f   # "bot ishga tushdi" chiqsa — tayyor
 ```
 
-5. Botga video tashlang.
+6. Botga video tashlang.
 
 Yangilash: `git pull && docker compose up -d --build`
 
@@ -48,7 +50,7 @@ Natija: `data/compare_*.md` (ikkala matn) va `data/*_whisper.mp4`, `data/*_eleve
 
 ## Cheklovlar (MVP)
 
-- Oddiy Telegram bot 20 MB gacha video qabul qiladi. Videoni **fayl emas, video** qilib yuborilsa, Telegram o'zi siqadi.
-  Kattaroq fayllar uchun keyin o'z Bot API serverimizni qo'shamiz (`TELEGRAM_API_URL`).
+- Serverda (docker compose) o'z Bot API serverimiz bilan **2 GB gacha** video qabul qilinadi.
+  Kompyuterda `py bot.py` bilan ishlatilganda — 20 MB gacha (oddiy Telegram API cheklovi).
 - Bir vaqtda bitta video ishlanadi, qolganlari navbatda turadi.
 - To'lov hali yo'q — `ALLOWED_IDS` bilan faqat sinovchilarga ochiq.
