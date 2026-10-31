@@ -31,11 +31,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("montaj")
 
 TOKEN = os.environ["BOT_TOKEN"]
-DEFAULT_STT = os.getenv("STT", "eleven")
+# ElevenLabs kaliti bo'lsa — avtomatik ElevenLabs, bo'lmasa Whisper
+DEFAULT_STT = "eleven" if os.getenv("ELEVENLABS_API_KEY") else "whisper"
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_IDS", "").replace(" ", "").split(",") if x}
 LOCAL_API = os.getenv("TELEGRAM_API_URL")
 MAX_MB = 2000 if LOCAL_API else 20
-MAX_IMAGES = 10
 
 session = AiohttpSession(api=TelegramAPIServer.from_base(LOCAL_API, is_local=True)) if LOCAL_API else None
 bot = Bot(TOKEN, session=session) if session else Bot(TOKEN)
@@ -43,8 +43,7 @@ dp = Dispatcher()
 queue: asyncio.Queue[Callable[[], Awaitable[None]]] = asyncio.Queue()
 user_stt: dict[int, str] = {}
 
-MOTIONS = {"none": "Oddiy (zoomsiz)", "soft": "Yumshoq zoom", "jump": "Jump-cut zoom"}
-LAYOUTS = {"under": "Subtitr ostida", "split": "Ekran 50/50"}
+MOTIONS = {"none": "Oddiy", "soft": "Yengil zoom"}
 STYLE_KEYS = list(STYLES)
 
 
@@ -55,7 +54,7 @@ class Session:
     src: str = ""
     words: list = field(default_factory=list)
     provider: str = ""
-    # cut → style → motion → images → layout → confirm → (matn kutilmoqda) → text → render
+    # cut → style → motion → music → confirm → (matn kutilmoqda) → text → render
     stage: str = "cut"
     opt: Options = field(default_factory=Options)
     stt_done: bool = False
@@ -85,8 +84,8 @@ HELLO = (
     "Talking head video tashlang. Avval hamma narsani tanlab olasiz:\n"
     "1. pauzalar kesilsinmi\n"
     "2. subtitr uslubi (4 xil namuna ko'rsataman)\n"
-    "3. zoom — yumshoq yoki jump-cut\n"
-    "4. rasmlar — subtitr ostida yoki ekran 50/50\n"
+    "3. oddiy yoki yengil zoom\n"
+    "4. fon musiqasi (ixtiyoriy)\n"
     "Shu orada men nutqni matnga o'giraman — oxirida matnni tasdiqlaysiz va montaj boshlanadi.\n\n"
     f"Video {MAX_MB} MB gacha. Bekor qilish: /bekor"
 )
@@ -225,22 +224,14 @@ async def ask_style(m: Message, s: Session):
 
 
 async def ask_motion(m: Message):
-    await m.answer("🎥 Kamera harakati:\n• Yumshoq zoom — butun video davomida sekin yaqinlashadi\n"
-                   "• Jump-cut zoom — har kesimda kadr navbat bilan yaqinlashib-uzoqlashadi",
-                   reply_markup=kb([("Oddiy", "motion:none")], [("🔍 Yumshoq zoom", "motion:soft"), ("⚡ Jump-cut", "motion:jump")]))
+    await m.answer("🎥 Video qanday bo'lsin?\n• Oddiy — kamera qimirlamaydi\n• Yengil zoom — butun video davomida sekin yaqinlashadi",
+                   reply_markup=kb([("Oddiy", "motion:none"), ("🔍 Yengil zoom", "motion:soft")]))
 
 
-async def ask_images(m: Message, s: Session):
-    n = len(s.opt.images)
-    txt = ("🖼 Videoga rasm qo'shasizmi? Rasmlarni shu yerga yuboring (10 tagacha), keyin «Tayyor» ni bosing.\n"
-           "Rasmlar video bo'ylab teng taqsimlanib chiqadi." if not n else f"🖼 {n} ta rasm qabul qilindi. Yana yuboring yoki «Tayyor».")
-    await m.answer(txt, reply_markup=kb([("⏭ Rasmsiz", "img:skip"), (f"✅ Tayyor ({n})", "img:done")]))
-
-
-async def ask_layout(m: Message):
-    await m.answer("📐 Rasm qayerda chiqsin?\n• Subtitr ostida — rasm pastda kartochka bo'lib, subtitr uning ustida\n"
-                   "• Ekran 50/50 — tepada rasm, pastda siz",
-                   reply_markup=kb([("⬇️ Subtitr ostida", "layout:under"), ("🌓 Ekran 50/50", "layout:split")]))
+async def ask_music(m: Message):
+    await m.answer("🎵 Fon musiqasi qo'shasizmi? Musiqa faylini (mp3) shu yerga yuboring — u ovozingizdan past, "
+                   "gapirganingizda yana pasayib turadi.",
+                   reply_markup=kb([("🔇 Musiqasiz", "music:none")]))
 
 
 async def ask_confirm(m: Message, s: Session):
@@ -249,25 +240,27 @@ async def ask_confirm(m: Message, s: Session):
         "📋 Montaj sozlamalari:",
         f"• Pauzalar: {'kesiladi' if o.cut else 'qoldiriladi'}",
         "• Subtitr: " + (STYLES[o.style].name.split(" —")[0] if o.style else "yo'q"),
-        f"• Kamera: {MOTIONS[o.motion]}",
-        f"• Rasmlar: {len(o.images)} ta" + (f", {LAYOUTS[o.layout]}" if o.images else ""),
+        f"• Video: {MOTIONS[o.motion]}",
+        "• Musiqa: " + ("bor" if o.music else "yo'q"),
     ]
     await m.answer("\n".join(lines), reply_markup=kb([("✅ Tasdiqlash", "go")], [("🔄 Qaytadan tanlash", "redo")]))
 
 
-@dp.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
-async def on_photo(m: Message):
+@dp.message(F.audio | F.voice | (F.document & F.document.mime_type.startswith("audio/")))
+async def on_music(m: Message):
     s = sessions.get(m.from_user.id)
-    if not s or s.stage != "images":
-        return await m.answer("Rasmni videoni sozlash paytida, «rasm qo'shasizmi?» bosqichida yuboring.")
-    if len(s.opt.images) >= MAX_IMAGES:
-        return await m.answer(f"Ko'pi bilan {MAX_IMAGES} ta rasm.")
-    fid = m.photo[-1].file_id if m.photo else m.document.file_id
-    path = os.path.join(s.work, f"img_{len(s.opt.images)}.jpg")
-    f = await bot.get_file(fid)
-    await bot.download_file(f.file_path, path)
-    s.opt.images.append(path)
-    await ask_images(m, s)
+    if not s or s.stage != "music":
+        return await m.answer("Musiqani «fon musiqasi qo'shasizmi?» bosqichida yuboring.")
+    media = m.audio or m.voice or m.document
+    if (media.file_size or 0) > 20 * 1024 * 1024:
+        return await m.answer("Musiqa fayli 20 MB dan kichik bo'lsin.")
+    ext = os.path.splitext(getattr(media, "file_name", "") or "")[1] or ".mp3"
+    path = os.path.join(s.work, "music" + ext)
+    f = await bot.get_file(media.file_id)
+    await bot.download_file(f.file_path, path, timeout=120)
+    s.opt.music = path
+    s.stage = "confirm"
+    await ask_confirm(m, s)
 
 
 @dp.callback_query()
@@ -295,21 +288,12 @@ async def on_cb(c: CallbackQuery):
         s.opt.style = None if val == "-" else val
         s.stage = "motion"
         await ask_motion(m)
-    elif key == "motion" and s.stage == "motion":
+    elif key == "motion" and s.stage == "motion" and val in MOTIONS:
         s.opt.motion = val
-        s.stage = "images"
-        await ask_images(m, s)
-    elif key == "img" and s.stage == "images":
-        if val == "skip":
-            s.opt.images = []
-        if s.opt.images:
-            s.stage = "layout"
-            await ask_layout(m)
-        else:
-            s.stage = "confirm"
-            await ask_confirm(m, s)
-    elif key == "layout" and s.stage == "layout":
-        s.opt.layout = val
+        s.stage = "music"
+        await ask_music(m)
+    elif key == "music" and s.stage == "music":
+        s.opt.music = None
         s.stage = "confirm"
         await ask_confirm(m, s)
     elif key == "redo" and s.stage == "confirm":

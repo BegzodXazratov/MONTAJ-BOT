@@ -225,6 +225,7 @@ class Options:
     motion: str = "none"              # none | soft | jump
     images: list[str] = field(default_factory=list)
     layout: str = "under"             # under (subtitr ostida) | split (50/50)
+    music: str | None = None          # fon musiqasi fayli
 
 
 def _frame(label_in: str, label_out: str, info: dict, fw: int, fh: int, crop_y: str = "(ih-oh)/2") -> list[str]:
@@ -293,11 +294,22 @@ def render(src: str, pieces: list[tuple[float, float]], ass: str | None, out: st
         else:
             cur = f"c{n - 1}"
 
+    if opt.music:  # fon musiqasi: past ovozda, gap paytida yana pasayadi (ducking)
+        mi = 1 + len(opt.images)
+        inputs += ["-stream_loop", "-1", "-i", opt.music]
+        fade_out = max(0.0, total - 1.5)
+        parts.append(f"[{mi}:a]atrim=0:{total:.3f},asetpts=PTS-STARTPTS,aresample=48000,volume=0.22,"
+                     f"afade=t=in:d=1,afade=t=out:st={fade_out:.3f}:d=1.5[mus]")
     if ass:
         parts.append(f"[{cur}]ass='{_fpath(ass)}':fontsdir='{_fpath(FONTS_DIR)}'[vout]")
     else:
         parts.append(f"[{cur}]null[vout]")
-    parts.append("[ac]highpass=f=80,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]")
+    if opt.music:
+        parts.append("[ac]highpass=f=80,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000,asplit[vo1][vo2]")
+        parts.append("[mus][vo2]sidechaincompress=threshold=0.03:ratio=8:attack=30:release=500[duck]")
+        parts.append("[vo1][duck]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[aout]")
+    else:
+        parts.append("[ac]highpass=f=80,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]")
 
     graph = ";".join(parts)
     if len(graph) < 28000:
