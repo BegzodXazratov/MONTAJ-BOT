@@ -55,8 +55,11 @@ class Session:
     src: str = ""
     words: list = field(default_factory=list)
     provider: str = ""
-    stage: str = "stt"  # stt → text → cut → style → motion → images → layout → confirm → render
+    # cut → style → motion → images → layout → confirm → (matn kutilmoqda) → text → render
+    stage: str = "cut"
     opt: Options = field(default_factory=Options)
+    stt_done: bool = False
+    stt_error: str = ""
 
 
 sessions: dict[int, Session] = {}
@@ -78,12 +81,12 @@ def drop(uid: int):
 
 HELLO = (
     "Salom! Men montaj botman 🎬\n\n"
-    "Talking head video tashlang — men:\n"
-    "1. nutqni matnga o'giraman va sizga tasdiqlatib olaman\n"
-    "2. pauzalarni kesish-kesmaslikni so'rayman\n"
-    "3. 4 xil subtitr uslubini ko'rsataman — tanlaysiz\n"
-    "4. zoom (yumshoq yoki jump-cut) qo'shaman\n"
-    "5. rasm yuborsangiz — subtitr ostida yoki ekranni 50/50 bo'lib chiqaraman\n\n"
+    "Talking head video tashlang. Avval hamma narsani tanlab olasiz:\n"
+    "1. pauzalar kesilsinmi\n"
+    "2. subtitr uslubi (4 xil namuna ko'rsataman)\n"
+    "3. zoom — yumshoq yoki jump-cut\n"
+    "4. rasmlar — subtitr ostida yoki ekran 50/50\n"
+    "Shu orada men nutqni matnga o'giraman — oxirida matnni tasdiqlaysiz va montaj boshlanadi.\n\n"
     f"Video {MAX_MB} MB gacha. Bekor qilish: /bekor"
 )
 
@@ -126,31 +129,43 @@ async def on_video(m: Message):
     s = Session(uid=uid, work=tempfile.mkdtemp(prefix="mb_"))
     s.src = os.path.join(s.work, "in.mp4")
     sessions[uid] = s
-    pos = queue.qsize() + 1
-    note = await m.answer("✅ Qabul qilindi. Nutq matnga o'girilmoqda…" if pos == 1 else f"✅ Qabul qilindi. Navbatda: {pos}-o'rin")
+    note = await m.answer("✅ Video qabul qilindi. Montaj sozlamalarini tanlaymiz — shu orada matn tayyorlanadi.")
+    try:
+        f = await bot.get_file(media.file_id)
+        if LOCAL_API and f.file_path and os.path.isabs(f.file_path):
+            shutil.copy(f.file_path, s.src)
+        else:
+            await bot.download_file(f.file_path, s.src)
+    except Exception as e:
+        drop(uid)
+        return await note.edit_text(f"❌ Videoni yuklab bo'lmadi: {str(e)[:200]}")
 
-    async def job():
+    async def job():  # fonda: nutq → matn
         try:
-            f = await bot.get_file(media.file_id)
-            if LOCAL_API and f.file_path and os.path.isabs(f.file_path):
-                shutil.copy(f.file_path, s.src)
-            else:
-                await bot.download_file(f.file_path, s.src)
-            await note.edit_text("🎧 Nutq matnga o'girilmoqda…")
             wav = os.path.join(s.work, "a.wav")
             await asyncio.to_thread(pipeline.extract_audio, s.src, wav)
             tr = await asyncio.to_thread(stt.transcribe, wav, user_stt.get(uid, DEFAULT_STT))
             if not tr.words:
                 raise RuntimeError("Videoda nutq topilmadi")
-            s.words, s.provider, s.stage = tr.words, tr.provider, "text"
-            await note.delete()
-            await send_text(m, s)
+            s.words, s.provider = tr.words, tr.provider
         except Exception as e:
             log.exception("stt failed")
-            drop(uid)
-            await note.edit_text(f"❌ Xatolik: {str(e)[:300]}")
+            s.stt_error = str(e)[:300]
+        s.stt_done = True
+        if sessions.get(uid) is s and s.stage == "wait_text":
+            await show_text(m, s)
 
     await queue.put(job)
+    await ask_cut(m)
+
+
+async def show_text(m: Message, s: Session):
+    """Sozlamalar tanlangan va matn tayyor bo'lganda — matnni tasdiqlatish."""
+    if s.stt_error:
+        drop(s.uid)
+        return await m.answer(f"❌ Nutqni o'girishda xato: {s.stt_error}")
+    s.stage = "text"
+    await send_text(m, s)
 
 
 async def send_text(m: Message, s: Session):
@@ -158,15 +173,17 @@ async def send_text(m: Message, s: Session):
     await m.answer(
         f"📝 Matn ({s.provider}):\n\n{text[:3500]}\n\n"
         "To'g'rimi? Xato bo'lsa — matnni nusxalab, tuzatib, shu yerga yozib yuboring.",
-        reply_markup=kb([("✅ Matn to'g'ri", "ok_text")]),
+        reply_markup=kb([("✅ Matn to'g'ri — montajni boshlash", "ok_text")]),
     )
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(m: Message):
     s = sessions.get(m.from_user.id)
-    if not s or s.stage != "text":
+    if not s:
         return await m.answer("Video tashlang — montajni boshlaymiz 🎬")
+    if s.stage != "text":
+        return await m.answer("Hozir yuqoridagi tugmalardan tanlang. Matnni oxirida tasdiqlaysiz.")
     s.words = pipeline.align_text(s.words, m.text)
     s.provider = "tuzatilgan"
     await send_text(m, s)
@@ -182,9 +199,12 @@ async def ask_style(m: Message, s: Session):
     wait = await m.answer("🎨 Subtitr uslublari tayyorlanmoqda…")
     try:
         media = []
+        mid = pipeline.probe(s.src)["duration"] / 2
+        sample = [stt.Word(t, mid - 0.6 + i * 0.35, mid - 0.35 + i * 0.35)
+                  for i, t in enumerate("Subtitr mana shunaqa ko'rinadi".split())]
         for i, k in enumerate(STYLE_KEYS, 1):
             jpg = os.path.join(s.work, f"pv_{k}.jpg")
-            await asyncio.to_thread(pipeline.preview, s.src, s.words, k, jpg, s.work)
+            await asyncio.to_thread(pipeline.preview, s.src, sample, k, jpg, s.work)
             media.append(InputMediaPhoto(media=FSInputFile(jpg), caption=f"{i}. {STYLES[k].name}"))
         await m.answer_media_group(media)
     except Exception:
@@ -223,7 +243,7 @@ async def ask_confirm(m: Message, s: Session):
         f"• Kamera: {MOTIONS[o.motion]}",
         f"• Rasmlar: {len(o.images)} ta" + (f", {LAYOUTS[o.layout]}" if o.images else ""),
     ]
-    await m.answer("\n".join(lines), reply_markup=kb([("🎬 Montajni boshlash", "go")], [("🔄 Qaytadan tanlash", "redo")]))
+    await m.answer("\n".join(lines), reply_markup=kb([("✅ Tasdiqlash", "go")], [("🔄 Qaytadan tanlash", "redo")]))
 
 
 @dp.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
@@ -256,8 +276,8 @@ async def on_cb(c: CallbackQuery):
         pass
 
     if key == "ok_text" and s.stage == "text":
-        s.stage = "cut"
-        await ask_cut(m)
+        s.stage = "render"
+        await start_render(m, s)
     elif key == "cut" and s.stage == "cut":
         s.opt.cut = val == "1"
         s.stage = "style"
@@ -288,8 +308,11 @@ async def on_cb(c: CallbackQuery):
         s.stage = "cut"
         await ask_cut(m)
     elif key == "go" and s.stage == "confirm":
-        s.stage = "render"
-        await start_render(m, s)
+        if s.stt_done:
+            await show_text(m, s)
+        else:
+            s.stage = "wait_text"
+            await m.answer("⏳ Sozlamalar saqlandi. Matn tayyor bo'lishi bilan yuboraman — tasdiqlasangiz montaj boshlanadi.")
 
 
 # ---------------- 7. montaj ----------------
