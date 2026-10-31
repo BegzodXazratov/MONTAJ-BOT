@@ -174,11 +174,16 @@ def render(src: str, segs: list[tuple[float, float]], ass: str | None, out: str,
         parts.append("[vf]null[vout]")
     parts.append("[ac]highpass=f=80,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[aout]")
 
-    script = os.path.join(workdir, "filter.txt")
-    Path(script).write_text(";\n".join(parts), encoding="utf-8")
+    graph = ";".join(parts)
+    if len(graph) < 28000:  # oddiy holat: filtrni to'g'ridan-to'g'ri beramiz (har qanday ffmpeg versiyasida ishlaydi)
+        fc = ["-filter_complex", graph]
+    else:  # juda ko'p kesim bo'lsa — fayl orqali (ffmpeg 7.1+ sintaksisi)
+        script = os.path.join(workdir, "filter.txt")
+        Path(script).write_text(graph, encoding="utf-8")
+        fc = ["-/filter_complex", script]
     preset = os.getenv("X264_PRESET", "veryfast")
     run([
-        "ffmpeg", "-y", "-v", "error", "-i", src, "-filter_complex_script", script,
+        "ffmpeg", "-y", "-v", "error", "-i", src, *fc,
         "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-preset", preset, "-crf", "20", "-maxrate", "9M", "-bufsize", "18M",
         "-pix_fmt", "yuv420p", "-r", "30",
