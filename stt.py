@@ -46,8 +46,15 @@ def _whisper():
 
 def whisper_transcribe(wav: str, language: str = "uz") -> Transcript:
     t0 = time.time()
+    # wav'ni o'zimiz o'qiymiz — PyAV (av) versiyalaridagi nomuvofiqlikdan qochish uchun
+    import wave
+
+    import numpy as np
+
+    with wave.open(wav, "rb") as w:
+        audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
     segments, _ = _whisper().transcribe(
-        wav,
+        audio,
         language=language,
         word_timestamps=True,
         vad_filter=True,
