@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - models:/root/.cache/huggingface   # Whisper modeli bir marta yuklanadi
+      - ./data:/data                      # compare.py uchun videolar
+volumes:
+  models:
