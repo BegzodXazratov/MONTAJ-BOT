@@ -168,7 +168,7 @@ def render(src: str, segs: list[tuple[float, float]], ass: str | None, out: str,
         parts.append("[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=30[vf]")
     if ass:
         ass_esc = ass.replace("\\", "/").replace(":", "\\:")
-        fonts_esc = FONTS_DIR.replace(":", "\\:")
+        fonts_esc = FONTS_DIR.replace("\\", "/").replace(":", "\\:")
         parts.append(f"[vf]ass='{ass_esc}':fontsdir='{fonts_esc}'[vout]")
     else:
         parts.append("[vf]null[vout]")
